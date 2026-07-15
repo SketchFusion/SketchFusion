@@ -10,10 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <fstream>
 #include "bobhash.h"
 #include "aion_bf.hpp"
 
-// 任务ID：A(0)=包数(StableSketch)，B(1)=字节(StableSketch)，C(2)=持续性(P-Sketch)，P(3)=周期流(Aion)，E(4)=基数/子网基数(SegSketch)，F(5)=突发流(BurstSketch风格)
+// 任务ID：A(0)=包数(StableSketch)，B(1)=字节(StableSketch)，C(2)=持续性(P-Sketch)，D(3)=周期流(Aion)，E(4)=基数/子网基数(SegSketch)，F(5)=突发流(BurstSketch风格)
 static constexpr int TASK_NUM = 6;
 
 // SplitMix64：用于采样池/去重key混合（64-bit）
@@ -88,7 +89,6 @@ private:
 };
 
 class Sketch {
-
 public:
     // ================= 共享桶/独占桶：统一 layout =================
     // - Exclusive：每个任务一份 sketch（桶里不需要 task id）
@@ -97,7 +97,8 @@ public:
     //
     // A/B (StableSketch): (u1=stability, u2=count)
     // C   (Pandora)     : (u1=inactivity|flag, u2=persistence_count)
-    // P   (Aion)        : (u1,u2 合并为 128-bit count)
+    // D   (Aion)        : (u1,u2 合并为 128-bit count)
+    // F   (Burst)       : (u1=pack(Cpre,Ccur), u2=timestamp)
 
     struct SharedBucket {
         uint64_t key;
@@ -114,6 +115,12 @@ public:
         ExBucket() : key(UINT64_MAX), u1(0), u2(0) {}
     };
 
+    struct FStage1Cell {
+        uint64_t key;
+        uint32_t cnt;
+        FStage1Cell() : key(UINT64_MAX), cnt(0) {}
+    };
+
     static constexpr uint64_t C_FLAG_MASK  = 1ULL << 63;
     static constexpr uint64_t C_INACT_MASK = (1ULL << 63) - 1ULL;
     static constexpr uint64_t C_REPLACE_Z  = 18ULL;
@@ -123,6 +130,23 @@ public:
         uint64_t x = (inactivity & C_INACT_MASK);
         if (flag) x |= C_FLAG_MASK;
         return x;
+    }
+
+    static constexpr uint32_t D_REPORT_THRESHOLD = 64;
+
+    static constexpr uint32_t F_STAGE1_H = 6;
+    static constexpr uint32_t F_BURST_T = 16;
+    static constexpr uint32_t F_BURST_K = 2;
+    static constexpr uint32_t F_BURST_L = 6;
+    static constexpr uint32_t F_LAMBDA = 16;
+
+    static inline uint32_t f_cpre(uint64_t u1) { return (uint32_t)(u1 >> 32); }
+    static inline uint32_t f_ccur(uint64_t u1) { return (uint32_t)(u1 & 0xffffffffULL); }
+    static inline uint64_t f_pack(uint32_t cpre, uint32_t ccur) { return ((uint64_t)cpre << 32) | (uint64_t)ccur; }
+    static inline uint64_t f_scalar(uint64_t u1, uint64_t ts) {
+        uint64_t v = std::max<uint64_t>((uint64_t)f_cpre(u1), (uint64_t)f_ccur(u1));
+        if (ts != 0ULL) v = (UINT64_MAX - v < (uint64_t)F_LAMBDA) ? UINT64_MAX : (v + (uint64_t)F_LAMBDA);
+        return v;
     }
 
     static inline unsigned __int128 aion_get128(uint64_t hi, uint64_t lo) {
@@ -207,7 +231,6 @@ public:
         host_bm |= (1ULL << pos);
     }
 
-
     struct KMVSampler {
         struct Entry { uint64_t h = 0; uint64_t v = 0; };
         size_t m = 0;
@@ -225,48 +248,7 @@ public:
         void dumpValues(std::vector<uint64_t>& out) const;
         uint64_t estimateDistinctN() const;
     };
-struct FStage1Cell {
-        uint64_t key;
-        uint32_t cnt;
-        FStage1Cell() : key(UINT64_MAX), cnt(0) {}
-    };
 
-
-
-    static constexpr uint32_t D_REPORT_THRESHOLD = 1;//64;
-
-    // 与 build_6task_prefix_truncate.py 和 compute_ground_truth_abcdef_prefix_truncate.py 对齐：
-    // H=2, T=4, K=2, L=8，window_us 仍由 main 默认 1000us 控制。
-    static constexpr uint32_t F_STAGE1_H = 2;
-    static constexpr uint32_t F_BURST_T = 4;
-    static constexpr uint32_t F_BURST_K = 2;
-    static constexpr uint32_t F_BURST_L = 8;
-    static constexpr uint32_t F_LAMBDA = 16;
-    static constexpr uint64_t F_CONFIRMED_MASK = 1ULL << 63;
-    static constexpr uint64_t F_TS_MASK = F_CONFIRMED_MASK - 1ULL;
-
-    KMVSampler fSamplerShared;
-    uint64_t fNEstShared = 0;
-    uint64_t fMMassShared = 0;
-    double fAlphaShared = ZIPF_ALPHA_INIT;
-    bool fAlphaSharedFrozen = false;
-    std::deque<double> fAlphaSharedHist;
-    static inline uint32_t f_cpre(uint64_t u1) { return (uint32_t)(u1 >> 32); }
-    static inline uint32_t f_ccur(uint64_t u1) { return (uint32_t)(u1 & 0xffffffffULL); }
-    static inline uint64_t f_pack(uint32_t cpre, uint32_t ccur) { return ((uint64_t)cpre << 32) | (uint64_t)ccur; }
-    static inline uint64_t f_ts(uint64_t u2) { return (u2 & F_TS_MASK); }
-    static inline bool f_confirmed(uint64_t u2) { return (u2 & F_CONFIRMED_MASK) != 0ULL; }
-    static inline uint64_t f_pack_meta(uint64_t ts, bool confirmed) {
-        uint64_t x = (ts & F_TS_MASK);
-        if (confirmed) x |= F_CONFIRMED_MASK;
-        return x;
-    }
-    static inline uint64_t f_scalar(uint64_t u1, uint64_t u2) {
-        if (f_confirmed(u2)) return UINT64_MAX;
-        uint64_t v = (uint64_t)f_ccur(u1);
-        if (f_ts(u2) != 0ULL) v = (UINT64_MAX - v < (uint64_t)F_LAMBDA) ? UINT64_MAX : (v + (uint64_t)F_LAMBDA);
-        return v;
-    }
     Sketch(int row, int col,
            uint32_t allTimeBFBits = (1u << 22),
            int bfK = 3,
@@ -277,70 +259,49 @@ struct FStage1Cell {
 
     ~Sketch();
 
-    int norA=0;
-    int norB=0;
-    int norC=0;
-    int norD=0;
-    int norE=0;
-    int norF=0;
-
-    int colA=0;
-    int colB=0;
-    int colC=0;
-    int colD=0;
-    int colE=0;
-    int colF=0;
-
-    int shaA=0;
-    int shaB=0;
-    int shaC=0;
-    int shaD=0;
-    int shaE=0;
-    int shaF=0;
-int zhaA=0;
-    int zhaB=0;
-    int zhaC=0;
-    int zhaD=0;
-    int zhaE=0;
-    int zhaF=0;
-    int AllA=0;
-    int AllB=0;
-    int AllC=0;
-    int AllD=0;
-    int AllE=0;
-    int AllF=0;
-
-    int endA=0;
-    int endB=0;
-    int endC=0;
-    int endD=0;
-    int endE=0;
-    int endF=0;
-
-    int inA=0;
-    int inB=0;
-    int inC=0;
-    int inD=0;
-    int inE=0;
-    int inF=0;
     void processPacket(int task, uint64_t pairKey, uint32_t pktSize, uint32_t srcIp, const std::string& hashKey);
     void endTimeWindow();
- void processExclusiveBurstF(uint64_t itemKey, const std::string& hashKey);
-    bool processExclusiveBurstPromote(uint64_t itemKey, uint32_t C1, const std::string& hashKey);
 
     std::unordered_map<uint64_t, uint64_t> getSharedMap(int task) const;
     std::unordered_map<uint64_t, uint64_t> getExMap(int task) const;
 
+    const std::unordered_set<uint64_t>& getReportedDShared() const { return reportedDShared; }
+    const std::unordered_set<uint64_t>& getReportedDExclusive() const { return reportedDExclusive; }
+    const std::unordered_set<uint64_t>& getReportedFShared() const { return reportedFShared; }
+    const std::unordered_set<uint64_t>& getReportedFExclusive() const { return reportedFExclusive; }
+
+    struct BinaryMetrics {
+        uint64_t tp = 0;
+        uint64_t fp = 0;
+        uint64_t fn = 0;
+        double precision = 0.0;
+        double recall = 0.0;
+        double f1 = 0.0;
+    };
+
+    // 二分类评测接口：
+    // - task 3(D) / 5(F): 只按 yes/no 统计 TP/FP/FN/Precision/Recall/F1，不统计值误差，也不统计 ARE。
+    //   预测正例集合 = 当前 sketch 中仍保留的 key ∪ 已上报集合(reportedD*/reportedF*)。
+    // - task 4(E): 若 positiveThreshold > 0，则把估计值/GT值 >= threshold 的 key 视为正例；
+    //   若 CSV 已自带 label/gt/is_positive 列，也可直接按 yes/no 评测 Precision/Recall/F1。
+    // - 若 CSV 没有 task 列，则视为“该 task 对应的一份专用 GT 文件”；
+    //   若有 task 列，则只读取与 task 匹配的行。
+    BinaryMetrics evaluateBinaryTaskAgainstCsv(int task, const std::string& csvPath, bool shared, uint64_t positiveThreshold = 0) const;
+    std::unordered_set<uint64_t> getPredictedPositiveKeys(int task, bool shared, uint64_t positiveThreshold = 0) const;
+
 private:
     int row = 0, col = 0, exCol = 0;
 
-    // shared：五任务共享一份桶池
+    // shared：六任务共享一份桶池
     SharedBucket **bucket = nullptr;
 
     // exclusive：每任务一份桶池
     ExBucket ***exBuckets = nullptr;
+
+    // F 的 Stage1 在 shared / exclusive 中各自独立，不共享
     FStage1Cell **fStage1Shared = nullptr;
     FStage1Cell **fStage1Ex = nullptr;
+
     // 通用哈希（A/B/C/E 使用）；Aion(P) 使用其公开代码里的 BOBHash64(key, seed)
     BOBHash **hashFunctions = nullptr;
 
@@ -358,20 +319,36 @@ private:
     uint64_t N_est[TASK_NUM];
     uint64_t M_mass[TASK_NUM];
 
+    // A/B/C/D/E/F 六个任务的 M / 采样池 / N 都只在 shared 版本中维护；exclusive 版本不维护这些统计量。
+    KMVSampler fSamplerShared;
+    uint64_t fNEstShared = 0;
+    uint64_t fMMassShared = 0;
+    double fAlphaShared = ZIPF_ALPHA_INIT;
+    bool fAlphaSharedFrozen = false;
+    std::deque<double> fAlphaSharedHist;
+
     uint64_t curWindowId = 0;
 
     // C/D/E 三个任务分别使用 BloomFilter 去重：
-    // C: 当前窗口内 distinct(src,dst) -> 对应总 distinct(s,d,t) 数
-    // D: 当前窗口内 distinct(src,dst) 仅用于 M/N 与采样估计；Aion filter 与 sketch 插入仍对窗口内重复包继续执行
-    // E: 全局 distinct(src,dst)      -> 对应总 distinct(s,d) 数
+    // C: 当前窗口内 distinct(src,dst) -> 对应总 distinct(s,d,t) 数（shared 统计）
+    // D: 当前窗口内 distinct(src,dst) 仅用于 shared 侧的 M/N 与采样估计；Aion filter 与 sketch 插入仍对窗口内重复包继续执行
+    // E: 全局 distinct(src,dst)      -> 对应总 distinct(s,d) 数（shared 统计）
     BloomFilter persistPairWinBF;
     BloomFilter aionPairWinBF;
     BloomFilter ePairBF;
+
+    // D/F 共用黑名单 BloomFilter（shared/exclusive 分开维护，便于分别评测）
     BloomFilter blacklistDFShared;
     BloomFilter blacklistDFEx;
 
-    // Aion Filter Part
-    aion::BH_BF<uint64_t, uint64_t>* aionBH = nullptr;
+    std::unordered_set<uint64_t> reportedDShared;
+    std::unordered_set<uint64_t> reportedDExclusive;
+    std::unordered_set<uint64_t> reportedFShared;
+    std::unordered_set<uint64_t> reportedFExclusive;
+
+    // Aion Filter Part（shared / exclusive 分开维护）
+    aion::BH_BF<uint64_t, uint64_t>* aionBHShared = nullptr;
+    aion::BH_BF<uint64_t, uint64_t>* aionBHEx = nullptr;
     uint32_t aionTolerance = 17;
     uint64_t aionBfCounter = 1;
 
@@ -380,18 +357,17 @@ private:
     static double estimateAlphaFromValues(const std::vector<uint64_t>& vals, double fallback);
     static double medianOfDeque(std::deque<double> dq);
     double getAlphaUsed(int task) const;
-
     double getAlphaUsedShared(int task) const;
+
     int getBucketIndex(int row_idx, const std::string& key, bool ex) const;
 
     double getPercentFast(int task, uint64_t value) const;
-     double getPercentFastShared(int task, uint64_t value) const;
+    double getPercentFastShared(int task, uint64_t value) const;
     double getPercentFast128(int task, unsigned __int128 value) const;
-
-    unsigned __int128 getValueFast128(int task, double percent) const;
-
     uint64_t getValueFast(int task, double percent) const;
     uint64_t getValueFastShared(int task, double percent) const;
+    unsigned __int128 getValueFast128(int task, double percent) const;
+
     uint64_t bucketScalar(int task, uint64_t u1, uint64_t u2) const;
 
     void processSharedStableAB(int task, uint64_t itemKey, uint32_t pktSize, const std::string& hashKey);
@@ -405,8 +381,11 @@ private:
     void processExclusivePSketchC(int task, uint64_t itemKey, const std::string& hashKey); // C task now follows Pandora logic
     void processExclusiveAionP(uint64_t itemKey, uint32_t dd);
     void processExclusiveSegSketchE(uint64_t hostKey, uint32_t ip_dst, const std::string& hostHashKey);
+    void processExclusiveBurstF(uint64_t itemKey, const std::string& hashKey);
+    bool processExclusiveBurstPromote(uint64_t itemKey, uint32_t C1, const std::string& hashKey);
+
+    void clearSharedBucket(SharedBucket &b);
+    void clearExBucket(ExBucket &b);
 
     static bool hitProb(double p);
-    static void clearSharedBucket(SharedBucket &b);
-    static void clearExBucket(ExBucket &b);
 };
