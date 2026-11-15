@@ -14,6 +14,9 @@
 #include "322sketch.h"
 #include "322ground.h"
 
+// Defined in 322sketch.cpp; no change to the original 322sketch.h is needed.
+void setBlacklistFPRStartWindow(const Sketch* sketch, uint64_t startWindow);
+
 static std::string ipToString(uint32_t ip_host) {
     struct in_addr ip_addr;
     uint32_t ip_network = htonl(ip_host);
@@ -341,6 +344,57 @@ static void printRes(const std::string& title, const EvalResult& r) {
 }
 
 
+// Snapshot of the CURRENT sketch against the original full-trace CSV labels.
+// This is not a per-interval F1, and warmup still contributes to predictions.
+static void printF1Snapshot(
+    const Sketch& sketch,
+    const GroundTruth& labels,
+    const BinaryUniverse& binaryUniverse,
+    uint64_t finishedWindows
+) {
+    // Effective thresholds from the original final evaluation (strict >).
+    constexpr uint64_t thA = 60;
+    constexpr uint64_t thB = 19000;
+    constexpr uint64_t thC = 45;
+    constexpr uint64_t thE = 12;
+
+    std::cout << "[F1 Snapshot] end_window=" << finishedWindows
+              << " prediction_windows=1-" << finishedWindows
+              << " label_scope=full_trace_csv\n";
+
+    auto printOne = [&](const char* side, const char* task, const EvalResult& result) {
+        const std::string title = "[F1] end_window=" + std::to_string(finishedWindows)
+                                + " [" + side + "] Task " + task;
+        printRes(title, result);
+    };
+
+    printOne("Shared", "A", evalPairs(sketch.getSharedMap(0), labels.getGtA(), thA));
+    printOne("Exclusive", "A", evalPairs(sketch.getExMap(0), labels.getGtA(), thA));
+    printOne("Shared", "B", evalPairs(sketch.getSharedMap(1), labels.getGtB(), thB));
+    printOne("Exclusive", "B", evalPairs(sketch.getExMap(1), labels.getGtB(), thB));
+    printOne("Shared", "C", evalPairs(sketch.getSharedMap(2), labels.getGtC(), thC));
+    printOne("Exclusive", "C", evalPairs(sketch.getExMap(2), labels.getGtC(), thC));
+
+    // D uses current bucket keys UNION all previously reported keys.
+    auto predDShared = keySetFromMap(sketch.getSharedMap(3));
+    mergeInto(predDShared, sketch.getReportedDShared());
+    auto predDEx = keySetFromMap(sketch.getExMap(3));
+    mergeInto(predDEx, sketch.getReportedDExclusive());
+    printOne("Shared", "D (binary)",
+             evalBinaryPairsWithUniverse(predDShared, labels.getGtDBinary(), binaryUniverse.taskDAll));
+    printOne("Exclusive", "D (binary)",
+             evalBinaryPairsWithUniverse(predDEx, labels.getGtDBinary(), binaryUniverse.taskDAll));
+
+    printOne("Shared", "E", evalHosts(sketch.getSharedMap(4), labels.getGtE(), thE));
+    printOne("Exclusive", "E", evalHosts(sketch.getExMap(4), labels.getGtE(), thE));
+
+    // F uses reported keys; endTimeWindow() must run before this snapshot.
+    printOne("Shared", "F (binary)",
+             evalBinaryPairsWithUniverse(sketch.getReportedFShared(), labels.getGtFBinary(), binaryUniverse.taskFAll));
+    printOne("Exclusive", "F (binary)",
+             evalBinaryPairsWithUniverse(sketch.getReportedFExclusive(), labels.getGtFBinary(), binaryUniverse.taskFAll));
+}
+
 struct ApaeAccumulator {
     double sum_abs_err = 0.0;
     uint64_t count = 0;
@@ -395,10 +449,59 @@ public:
         seenDThisWindow.clear();
         truthFThisWindow.clear();
     }
- 
+
+    void consumeSketchEvents(Sketch& sketch) {
+        auto events = sketch.drainApaeSampleEvents();
+        for (const auto& ev : events) {
+            if (ev.est_percentile < 0.0) continue;
+            double truePct = 0.0;
+            if (ev.task == 0) {
+                if (!computeTruePercentileMidRank(truthA, ev.key, truePct)) continue;
+                accA.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accA.count += 1;
+            } else if (ev.task == 1) {
+                if (!computeTruePercentileMidRank(truthB, ev.key, truePct)) continue;
+                accB.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accB.count += 1;
+            } else if (ev.task == 2) {
+                if (!computeTruePercentileMidRank(truthC, ev.key, truePct)) continue;
+                accC.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accC.count += 1;
+            } else if (ev.task == 3) {
+                if (!computeTruePercentileMidRank(truthD, ev.key, truePct)) continue;
+                accD.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accD.count += 1;
+            } else if (ev.task == 4) {
+                if (!computeTruePercentileMidRank(truthE, ev.key, truePct)) continue;
+                accE.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accE.count += 1;
+            } else if (ev.task == 5) {
+                if (!computeTruePercentileMidRank(truthFThisWindow, ev.key, truePct)) continue;
+                accF.sum_abs_err += std::fabs(ev.est_percentile - truePct);
+                accF.count += 1;
+            }
+        }
+    }
+
+    void printSummary() const {
+        printOne("[APAE] Task A (incremental)", accA);
+        printOne("[APAE] Task B (incremental)", accB);
+        printOne("[APAE] Task C (incremental)", accC);
+        printOne("[APAE] Task D (incremental)", accD);
+        printOne("[APAE] Task E (incremental)", accE);
+        printOne("[APAE] Task F (incremental)", accF);
+    }
 
 private:
-  
+    static void printOne(const std::string& title, const ApaeAccumulator& acc) {
+        std::cout << title << "\n";
+        if (acc.count == 0) {
+            std::cout << "  APAE=N/A (cnt=0)\n";
+            return;
+        }
+        std::cout << "  APAE=" << (acc.sum_abs_err / (double)acc.count)
+                  << " (cnt=" << acc.count << ")\n";
+    }
 
     std::unordered_map<uint64_t, uint64_t> truthA;
     std::unordered_map<uint64_t, uint64_t> truthB;
@@ -434,13 +537,84 @@ int main(int argc, char* argv[]) {
     uint32_t skewStableK = (argc >= 9) ? (uint32_t)std::stoul(argv[8]) : 5U;
     double skewEps = (argc >= 10) ? std::stod(argv[9]) : 0.05;
 
+    // 窗口从 1 开始编号。例如起始 501、间隔 500，首次在第 1000 窗输出。
+    constexpr uint64_t FPR_START_WINDOW = 100ULL;
+    constexpr uint64_t FPR_REPORT_WINDOWS = 100ULL;
+    constexpr uint32_t BF_BITS = 32768/4U; // 黑名单各用两倍位数，即各 8 KiB。
+    constexpr int BF_HASHES = 3;
+    static_assert(FPR_START_WINDOW >= 1 && FPR_REPORT_WINDOWS >= 1,
+                  "FPR start window and report interval must be >= 1");
+
     GroundTruth labels;
     if (!labels.loadABCDLabels(labelFile)) return 1;
     BinaryUniverse binaryUniverse = loadBinaryTaskUniverse(labelFile);
 
     Loader loader(dataFile, 30000000000ULL);
-    Sketch sketch(row, col, 399, 3, skewIntervalWins, skewSampleSize, skewStableK, skewEps);
+    Sketch sketch(row, col, BF_BITS, BF_HASHES,
+                  skewIntervalWins, skewSampleSize, skewStableK, skewEps);
+    setBlacklistFPRStartWindow(&sketch, FPR_START_WINDOW);
+    IncrementalApaeTracker apaeTracker;
 
+    uint64_t finishedWindows = 0;
+    uint64_t previousX[4] = {0, 0, 0, 0};
+    uint64_t previousY[4] = {0, 0, 0, 0};
+
+    std::cout << "[FPR/F1 Config] start_window=" << FPR_START_WINDOW
+              << " report_windows=" << FPR_REPORT_WINDOWS << '\n';
+
+    // Sketch.cpp starts sampling at FPR_START_WINDOW. Each never-inserted
+    // (key, query_id) is sampled at most once FROM THAT WINDOW onward.
+    // Counter differences cover new eligible samples in this report interval.
+    auto printBFFPR = [&]() {
+        const char* names[4] = {"F-Shared", "F-Exclusive", "D-Shared", "D-Exclusive"};
+        const uint64_t x[4] = {
+            static_cast<uint64_t>(sketch.FSC), static_cast<uint64_t>(sketch.FEC),
+            static_cast<uint64_t>(sketch.DSC), static_cast<uint64_t>(sketch.DEC)
+        };
+        const uint64_t y[4] = {
+            static_cast<uint64_t>(sketch.FSC1), static_cast<uint64_t>(sketch.FEC1),
+            static_cast<uint64_t>(sketch.DSC1), static_cast<uint64_t>(sketch.DEC1)
+        };
+        auto printRate = [](uint64_t fp, uint64_t negatives) {
+            if (negatives != 0) {
+                std::cout << 100.0 * static_cast<double>(fp)
+                                  / static_cast<double>(negatives) << "%";
+            } else {
+                std::cout << "N/A";
+            }
+        };
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t dx = x[i] - previousX[i];
+            const uint64_t dy = y[i] - previousY[i];
+            std::cout << "[BF FPR] windows="
+                      << (finishedWindows - FPR_REPORT_WINDOWS + 1)
+                      << "-" << finishedWindows << " " << names[i]
+                      << " interval_X=" << dx << " interval_Y=" << dy
+                      << " interval_FPR=";
+            printRate(dx, dy);
+            std::cout << " cumulative_windows=" << FPR_START_WINDOW
+                      << "-" << finishedWindows
+                      << " cumulative_X=" << x[i] << " cumulative_Y=" << y[i]
+                      << " cumulative_FPR=";
+            printRate(x[i], y[i]);
+            std::cout << '\n';
+            previousX[i] = x[i];
+            previousY[i] = y[i];
+        }
+    };
+
+    // Use the same completion path for crossed windows and the last window.
+    auto finishWindow = [&]() {
+        sketch.endTimeWindow();
+        apaeTracker.consumeSketchEvents(sketch);
+        apaeTracker.onTimeWindowEnded();
+        ++finishedWindows;
+        if (finishedWindows >= FPR_START_WINDOW &&
+            (finishedWindows - FPR_START_WINDOW + 1) % FPR_REPORT_WINDOWS == 0) {
+            printBFFPR();
+            printF1Snapshot(sketch, labels, binaryUniverse, finishedWindows);
+        }
+    };
  
 
     const char* TASK_NAME[TASK_NUM] = {"A", "B", "C", "D", "E", "F"};
@@ -454,17 +628,6 @@ int main(int argc, char* argv[]) {
 
     double firstInsertedTs = -1.0;
     double lastInsertedTs = -1.0;
-    const auto& gtA_packets = labels.getGtA();
-    const auto& gtB_bytes = labels.getGtB();
-    const auto& gtC_persist = labels.getGtC();
-    const auto& gtDBinary = labels.getGtDBinary();
-    const auto& gtE_card = labels.getGtE();
-    const auto& gtFBinary = labels.getGtFBinary();
-
-    uint64_t totalA = labels.totalA();
-    uint64_t totalB = labels.totalB();
-    uint64_t totalC = labels.totalC();
-
     dataItem item;
     const double windowSec = (windowUs > 0) ? ((double)windowUs / 1e6) : 1.0;
     double firstTs = -1.0;
@@ -496,8 +659,7 @@ int main(int argc, char* argv[]) {
         if (ts >= firstTs && windowSec > 0.0) newWin = (uint64_t)std::floor((ts - firstTs) / windowSec);
         if (newWin > curWin) {
             for (uint64_t w = curWin; w < newWin; ++w) {
-                sketch.endTimeWindow();
-     
+                finishWindow();
             }
             curWin = newWin;
         }
@@ -521,82 +683,16 @@ int main(int argc, char* argv[]) {
         if (task == 4) taskEHostSet.insert(src);  // 可选：E 的源主机数
 
         std::string hashKey = srcStr + "|" + dstStr;
-
+        apaeTracker.onPacketObserved(task, pairKey, src, dst, pktSize);
         sketch.processPacket(task, pairKey, pktSize, src, hashKey);
-     
+        apaeTracker.consumeSketchEvents(sketch);
     }
 
-    sketch.endTimeWindow();
- 
+    // As in the original program, EOF closes the last observed window.
+    // Empty input does not create a window; a tail shorter than FPR_REPORT_WINDOWS
+    // does not produce an extra FPR/F1 report.
+    if (firstTs >= 0.0) finishWindow();
 
-
-    const double ratio = 0.00006;
-    const double ratioA = 0.00001;
-    uint64_t thA = (uint64_t)std::floor((double)totalA * ratioA);
-    uint64_t thB = (uint64_t)std::floor((double)totalB * ratioA);
-    uint64_t thC = (uint64_t)std::floor((double)totalC * ratio);
-    uint64_t thE = 25;
-    if (thA == 0) thA = 1;
-    if (thB == 0) thB = 1;
-    if (thC == 0) thC = 1;
-
-
-    thA = 60; //60
-    thB = 19000; //9000
-    thC = 45; //45
-    uint64_t thD = 309; //300
-    thE = 12;  //12
-    auto shA = sketch.getSharedMap(0);
-    auto shB = sketch.getSharedMap(1);
-    auto shC = sketch.getSharedMap(2);
-    auto shD = sketch.getSharedMap(3);
-    auto shE = sketch.getSharedMap(4);
-
-    auto exA = sketch.getExMap(0);
-    auto exB = sketch.getExMap(1);
-    auto exC = sketch.getExMap(2);
-    auto exD = sketch.getExMap(3);
-    auto exE = sketch.getExMap(4);
-    std::cout<<"fenzi:FSC"<<sketch.FSC<<" "<<sketch.FSC1<<std::endl;
-    std::cout<<"fenzi:FEC"<<sketch.FEC<<" "<<sketch.FEC1<<std::endl;
-    std::cout<<"fenzi:DSC"<<sketch.DSC<<" "<<sketch.DSC1<<std::endl;
-    std::cout<<"fenzi:DEC"<<sketch.DEC<<" "<<sketch.DEC1<<std::endl;
-    printRes("[Shared] Task A", evalPairs(shA, gtA_packets, thA));
-
-    printRes("[Exclusive] Task A", evalPairs(exA, gtA_packets, thA));
-    printRes("[Shared] Task B", evalPairs(shB, gtB_bytes, thB));
-
-    printRes("[Exclusive] Task B", evalPairs(exB, gtB_bytes, thB));
-    printRes("[Shared] Task C", evalPairs(shC, gtC_persist, thC));
-
-    printRes("[Exclusive] Task C", evalPairs(exC, gtC_persist, thC));
-
-
-    // D：当前仍在桶中的 key ∪ 已上报集合 都算预测正例；但统计时只在 task-D universe 内评估
-    std::unordered_set<uint64_t> predDShared = keySetFromMap(shD);
-    mergeInto(predDShared, sketch.getReportedDShared());
-    std::unordered_set<uint64_t> predDEx = keySetFromMap(exD);
-    mergeInto(predDEx, sketch.getReportedDExclusive());
-    std::cout<<"dsh"<<predDShared.size()<<std::endl;
-    printRes("[Shared] Task D (binary)", evalBinaryPairsWithUniverse(predDShared, gtDBinary, binaryUniverse.taskDAll));
-    printRes("[Exclusive] Task D (binary)", evalBinaryPairsWithUniverse(predDEx, gtDBinary, binaryUniverse.taskDAll));
-    printRes("[Shared] Task E", evalHosts(shE, gtE_card, thE));
-  
-    printRes("[Exclusive] Task E", evalHosts(exE, gtE_card, thE));
-    // F：上报集合为预测正例；统计时只在 task-F universe 内评估
-    auto predFShared = sketch.getReportedFShared();
-    auto predFEx = sketch.getReportedFExclusive();
-
-    std::cout<<"dsh"<<predFShared.size()<<std::endl;
-    printRes("[Shared] Task F (binary)", evalBinaryPairsWithUniverse(predFShared, gtFBinary, binaryUniverse.taskFAll));
-    printRes("[Exclusive] Task F (binary)", evalBinaryPairsWithUniverse(predFEx, gtFBinary, binaryUniverse.taskFAll));
-
-    //std::cout<<"taskA"<<shA.size()<<" "<<exA.size()<<" "<<thA<<std::endl;
-    //std::cout<<"taskB"<<shB.size()<<" "<<exB.size()<<" "<<thB<<std::endl;
-    //std::cout<<"taskC"<<shC.size()<<" "<<exC.size()<<" "<<thC<<std::endl;
-    //std::cout<<"taskD"<<shD.size()<<" "<<exD.size()<<std::endl;
-    //std::cout<<"taskE"<<shE.size()<<" "<<exE.size()<<" "<<thE<<std::endl;
-    //std::cout<<"taskF"<<predFShared.size()<<" "<<predFEx.size()<<std::endl;
     double insertedDurationSec = 0.0;
     if (firstInsertedTs >= 0.0 && lastInsertedTs >= firstInsertedTs) {
         insertedDurationSec = lastInsertedTs - firstInsertedTs;
@@ -629,6 +725,7 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "\n";
     }
- 
+
+    apaeTracker.printSummary();
     return 0;
 }

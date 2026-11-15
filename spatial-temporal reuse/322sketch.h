@@ -311,11 +311,15 @@ private:
     uint64_t N_est[TASK_NUM];
     uint64_t M_mass[TASK_NUM];
     static constexpr int ME_COORD_NUM = 3;
+    static constexpr int ME_GRID_SIZE = 4; // Paper's default K for model averages.
+    static constexpr int ME_CDF_GRID_SIZE = 64;
     static constexpr double ME_ETA = 0.01;
-    static constexpr double ME_THETA_MAX = 8.0;
     static constexpr double ME_EPS = 1e-9;
+    // Paper descriptors for occupied shared buckets, including zero-valued ones.
+    uint64_t meCount[TASK_NUM];
+    long double mePowerSum[TASK_NUM][ME_COORD_NUM];
     double meTheta[TASK_NUM][ME_COORD_NUM];
-    uint64_t meMaxValue[TASK_NUM];
+    unsigned __int128 meMaxValue[TASK_NUM];
 
     KMVSampler fSamplerShared;
     uint64_t fNEstShared = 0;
@@ -363,10 +367,16 @@ private:
     uint64_t getValueFastShared(int task, double percent) const;
     unsigned __int128 getValueFast128(int task, double percent) const;
     static double mePhi(int coord, double z);
+    static const std::array<std::array<double, ME_COORD_NUM>, ME_GRID_SIZE>& meGridPhi();
+    unsigned __int128 meBucketValue(int task, uint64_t u1, uint64_t u2) const;
     double meNormalizeValue(int task, long double value) const;
-    double meDensityWeight(int task, double z) const;
+    double meModelWeights(int task, std::array<double, ME_GRID_SIZE>& weights) const;
+    double meCDFWeights(int task, std::array<double, ME_CDF_GRID_SIZE + 1>& weights) const;
     double meCDF(int task, double z) const;
-    void meApplyValueTransition(int task, uint64_t oldValue, uint64_t newValue);
+    long double meQuantileValue(int task, double percent) const;
+    void meUpdateModel(int task);
+    void meApplyValueTransition(int task, bool oldPresent, unsigned __int128 oldValue,
+                               bool newPresent, unsigned __int128 newValue);
     void meRescanMaxValue(int task);
     void setSharedBucket(SharedBucket &b, uint64_t key, int task, uint64_t u1, uint64_t u2);
 

@@ -2,6 +2,100 @@
 #include <iostream>
 #include <random>
 #include <cmath>
+#include <limits>
+
+// 黑名单扩展在本 cpp 内实现；FPR 起始窗口由 Main 设置。
+// 论文中的 P：每次插入先均匀随机选择 P 个不同 bit 清零，再置位当前 item。
+static const uint32_t BLACKLIST_CLEAR_BITS = 2;
+
+namespace {
+class CppBlacklistBF {
+    uint32_t numBits = 0;
+    std::vector<uint64_t> bits;
+    mutable std::vector<BOBHash> hashes;
+    std::mt19937 rng{1234567};
+    // Exact experiment-only history; aging/clear never erases these sets.
+    // Outer key = query ID (D=3, F=5), inner key = flow key.
+    std::unordered_map<int, std::unordered_set<uint64_t>> insertedPairs, sampledPairs;
+public:
+    CppBlacklistBF() = default;
+    CppBlacklistBF(uint32_t n, int k, uint32_t seed)
+        : numBits(std::max<uint32_t>(64, n)), bits((uint64_t(numBits) + 63) / 64, 0), rng(seed) {
+        hashes.reserve(k);
+        for (int i = 0; i < k; ++i) hashes.emplace_back(seed + i * 101);
+    }
+    void clear() { std::fill(bits.begin(), bits.end(), 0ULL); }
+    bool wasInserted(uint64_t key, int queryId) const {
+        auto it = insertedPairs.find(queryId);
+        return it != insertedPairs.end() && it->second.count(key) != 0;
+    }
+    bool firstNonInsertedQuery(uint64_t key, int queryId) {
+        if (wasInserted(key, queryId)) return false;
+        return sampledPairs[queryId].insert(key).second;
+    }
+    bool contains(uint64_t key, int queryId) const {
+        const uint64_t pair[2] = {key, static_cast<uint64_t>(queryId)};
+        if (numBits == 0) return false;
+        for (auto& hash : hashes) {
+            uint32_t pos = hash.run(reinterpret_cast<const char*>(pair), sizeof(pair)) % numBits;
+            if (!(bits[pos >> 6] & (1ULL << (pos & 63)))) return false;
+        }
+        return true;
+    }
+    void insert(uint64_t key, int queryId) {
+        const uint64_t pair[2] = {key, static_cast<uint64_t>(queryId)};
+        if (numBits == 0) return;
+        if (BLACKLIST_CLEAR_BITS > 0) {
+            std::unordered_set<uint32_t> positions;
+            std::uniform_int_distribution<uint32_t> dist(0, numBits - 1);
+            while (positions.size() < std::min(BLACKLIST_CLEAR_BITS, numBits)) {
+                uint32_t pos = dist(rng);
+                if (positions.insert(pos).second) bits[pos >> 6] &= ~(1ULL << (pos & 63));
+            }
+        }
+        for (auto& hash : hashes) {
+            uint32_t pos = hash.run(reinterpret_cast<const char*>(pair), sizeof(pair)) % numBits;
+            bits[pos >> 6] |= 1ULL << (pos & 63);
+        }
+        insertedPairs[queryId].insert(key);
+    }
+};
+struct CppBlacklistPair {
+    CppBlacklistBF shared, exclusive;
+    uint64_t fprStartWindow = 1;
+};
+static std::unordered_map<const Sketch*, CppBlacklistPair>& cppBlacklists() {
+    static std::unordered_map<const Sketch*, CppBlacklistPair> states;
+    return states;
+}
+static CppBlacklistBF& cppBlacklist(const Sketch* sketch, bool shared) {
+    auto& state = cppBlacklists()[sketch];
+    return shared ? state.shared : state.exclusive;
+}
+// Starting at fprStartWindow, X/Y are recorded at the first query BEFORE insertion.
+// Subsequent insertions or aging never subtract previously recorded counts.
+static void countBlacklistQuery(const Sketch* owner, uint64_t window1Based,
+                                int group, uint64_t key, bool hit,
+                                int& x, int& y, const char* name) {
+    // Do not let warmup queries consume entries in sampledPairs.
+    // Actual BF queries/insertions and insertedPairs remain active during warmup.
+    if (window1Based < cppBlacklists()[owner].fprStartWindow) return;
+    const bool shared = (group == 0 || group == 2);
+    const int queryId = (group < 2) ? 5 : 3;
+    auto& bf = cppBlacklist(owner, shared);
+    if (!bf.firstNonInsertedQuery(key, queryId)) return;
+    ++y;
+    if (hit) ++x;
+    if (y <= 3) std::cout << "[BF FPR Sample] " << name << " key=" << key
+                         << " query_id=" << queryId << " inserted_before_query=0 BF_hit=" << hit
+                         << " X=" << x << " Y=" << y << '\n';
+}
+} // namespace
+
+// Main calls this once, immediately after constructing the Sketch.
+void setBlacklistFPRStartWindow(const Sketch* sketch, uint64_t startWindow) {
+    cppBlacklists()[sketch].fprStartWindow = startWindow;
+}
 
 // ===================== 通用小工具 =====================
 static inline double clip01(double x) {
@@ -60,28 +154,62 @@ void Sketch::clearExBucket(ExBucket &b) {
 
 double Sketch::mePhi(int coord, double z) {
     z = clip01(z);
-    if (coord == 0) return 2.0 * z - 1.0;
-    if (coord == 1) return 6.0 * z * z - 6.0 * z + 1.0;
-    return 20.0 * z * z * z - 30.0 * z * z + 12.0 * z - 1.0;
+    const double x = 2.0 * z - 1.0;
+    double prev = 1.0, current = x;
+    for (int degree = 2; degree <= coord + 1; ++degree) {
+        const double next = ((2.0 * degree - 1.0) * x * current
+                           - (degree - 1.0) * prev) / degree;
+        prev = current;
+        current = next;
+    }
+    return current;
+}
+
+const std::array<std::array<double, Sketch::ME_COORD_NUM>, Sketch::ME_GRID_SIZE>&
+Sketch::meGridPhi() {
+    static const auto grid = []() {
+        std::array<std::array<double, ME_COORD_NUM>, ME_GRID_SIZE> values{};
+        for (int l = 0; l < ME_GRID_SIZE; ++l) {
+            const double z = (l + 0.5) / ME_GRID_SIZE;
+            for (int j = 0; j < ME_COORD_NUM; ++j) values[l][j] = mePhi(j, z);
+        }
+        return values;
+    }();
+    return grid;
+}
+
+unsigned __int128 Sketch::meBucketValue(int task, uint64_t u1, uint64_t u2) const {
+    // D stores a 128-bit value; do not saturate it to the 64-bit export scalar.
+    return task == 3 ? aion_get128(u1, u2)
+                     : (unsigned __int128)bucketScalar(task, u1, u2);
 }
 
 double Sketch::meNormalizeValue(int task, long double value) const {
     if (task < 0 || task >= TASK_NUM) return 0.0;
     if (!(value > 0.0L)) return 0.0;
     long double m = (long double)meMaxValue[task];
-    if (!(m > 0.0L)) return 0.0;
     return clip01((double)(value / (m + (long double)ME_EPS)));
 }
 
-double Sketch::meDensityWeight(int task, double z) const {
-    if (task < 0 || task >= TASK_NUM) return 1.0;
-    z = clip01(z);
-    double s = 0.0;
-    for (int j = 0; j < ME_COORD_NUM; ++j) {
-        s += meTheta[task][j] * mePhi(j, z);
+double Sketch::meModelWeights(int task, std::array<double, ME_GRID_SIZE>& weights) const {
+    if (task < 0 || task >= TASK_NUM) {
+        weights.fill(1.0);
+        return ME_GRID_SIZE;
     }
-    s = clipd(s, -40.0, 40.0);
-    return std::exp(s);
+    const auto& phi = meGridPhi();
+    double maxU = -std::numeric_limits<double>::infinity();
+    for (int l = 0; l < ME_GRID_SIZE; ++l) {
+        double u = 0.0;
+        for (int j = 0; j < ME_COORD_NUM; ++j) u += meTheta[task][j] * phi[l][j];
+        weights[l] = u;
+        maxU = std::max(maxU, u);
+    }
+    double total = 0.0;
+    for (double& w : weights) {
+        w = std::exp(w - maxU); // Paper Eq. (7): stable midpoint weights.
+        total += w;
+    }
+    return total;
 }
 
 double Sketch::meCDF(int task, double z) const {
@@ -89,87 +217,183 @@ double Sketch::meCDF(int task, double z) const {
     if (z <= 0.0) return 0.0;
     if (z >= 1.0) return 1.0;
 
-    static constexpr int GRID = 64;
-    double total = 0.0;
+    std::array<double, ME_CDF_GRID_SIZE + 1> weights;
+    const double total = meCDFWeights(task, weights);
     double prefix = 0.0;
-    double prevX = 0.0;
-    double prevW = meDensityWeight(task, 0.0);
-
-    for (int i = 1; i <= GRID; ++i) {
-        double x = (double)i / (double)GRID;
-        double w = meDensityWeight(task, x);
-        double area = 0.5 * (prevW + w) * (x - prevX);
-        total += area;
-
-        if (z > prevX) {
-            double right = std::min(z, x);
-            double ratio = (right - prevX) / (x - prevX);
-            double wz = prevW + (w - prevW) * ratio;
-            prefix += 0.5 * (prevW + wz) * (right - prevX);
-        }
-
-        prevX = x;
-        prevW = w;
+    // Preserve the original 64-cell trapezoidal CDF integration.
+    const double cellPosition = z * ME_CDF_GRID_SIZE;
+    for (int l = 0; l < ME_CDF_GRID_SIZE; ++l) {
+        const double fraction = clip01(cellPosition - l);
+        prefix += fraction * (weights[l]
+                            + 0.5 * fraction * (weights[l + 1] - weights[l]));
     }
-
-    if (!(total > 0.0)) return z;
     return clip01(prefix / total);
+}
+
+double Sketch::meCDFWeights(int task,
+                           std::array<double, ME_CDF_GRID_SIZE + 1>& weights) const {
+    if (task < 0 || task >= TASK_NUM) {
+        weights.fill(1.0);
+        return ME_CDF_GRID_SIZE;
+    }
+    double maxU = -std::numeric_limits<double>::infinity();
+    for (int l = 0; l <= ME_CDF_GRID_SIZE; ++l) {
+        const double z = (double)l / ME_CDF_GRID_SIZE;
+        double u = 0.0;
+        for (int j = 0; j < ME_COORD_NUM; ++j) u += meTheta[task][j] * mePhi(j, z);
+        weights[l] = u;
+        maxU = std::max(maxU, u);
+    }
+    for (double& w : weights) w = std::exp(w - maxU);
+    double total = 0.0;
+    for (int l = 0; l < ME_CDF_GRID_SIZE; ++l) {
+        total += 0.5 * (weights[l] + weights[l + 1]);
+    }
+    return total;
+}
+
+long double Sketch::meQuantileValue(int task, double percent) const {
+    if (task < 0 || task >= TASK_NUM || meCount[task] == 0) return 0.0L;
+    const double p = clip01(percent);
+    const long double scale = (long double)meMaxValue[task] + (long double)ME_EPS;
+    if (p <= 0.0) return 0.0L;
+    if (p >= 1.0) return scale;
+
+    std::array<double, ME_CDF_GRID_SIZE + 1> weights;
+    const double target = p * meCDFWeights(task, weights);
+    double prefix = 0.0;
+    for (int l = 0; l < ME_CDF_GRID_SIZE; ++l) {
+        const double area = 0.5 * (weights[l] + weights[l + 1]);
+        const double next = prefix + area;
+        if (area > 0.0 && target <= next) {
+            // Invert the integral of the linearly interpolated density in this cell.
+            double lo = 0.0, hi = 1.0;
+            for (int it = 0; it < 40; ++it) {
+                const double fraction = 0.5 * (lo + hi);
+                const double partial = fraction * (weights[l]
+                    + 0.5 * fraction * (weights[l + 1] - weights[l]));
+                if (partial < target - prefix) lo = fraction;
+                else hi = fraction;
+            }
+            return ((long double)l + 0.5 * (lo + hi)) / ME_CDF_GRID_SIZE * scale;
+        }
+        prefix = next;
+    }
+    return scale;
 }
 
 void Sketch::meRescanMaxValue(int task) {
     if (task < 0 || task >= TASK_NUM) return;
-    uint64_t mx = 0ULL;
+    unsigned __int128 mx = 0;
+    long double sums[ME_COORD_NUM] = {};
     for (int i = 0; i < row; ++i) {
         for (int j = 0; j < col; ++j) {
             const SharedBucket &b = bucket[i][j];
             if (b.key == UINT64_MAX || (int)b.task != task) continue;
-            mx = std::max<uint64_t>(mx, bucketScalar(task, b.u1, b.u2));
+            const unsigned __int128 raw = meBucketValue(task, b.u1, b.u2);
+            mx = std::max(mx, raw);
+            // A scan is already needed when the old maximum disappears.
+            // Refresh raw sums too, avoiding cancellation after a large removal.
+            long double power = 1.0L;
+            for (int m = 0; m < ME_COORD_NUM; ++m) {
+                power *= (long double)raw;
+                sums[m] += power;
+            }
         }
     }
     meMaxValue[task] = mx;
+    for (int m = 0; m < ME_COORD_NUM; ++m) mePowerSum[task][m] = sums[m];
 }
 
-void Sketch::meApplyValueTransition(int task, uint64_t oldValue, uint64_t newValue) {
-    if (task < 0 || task >= TASK_NUM) return;
-    if (oldValue == newValue) return;
+void Sketch::meUpdateModel(int task) {
+    if (meCount[task] == 0) return;
 
-    uint64_t oldMax = meMaxValue[task];
-    if (newValue > meMaxValue[task]) meMaxValue[task] = newValue;
-
-    double zOld = meNormalizeValue(task, (long double)oldValue);
-    double zNew = meNormalizeValue(task, (long double)newValue);
-    for (int j = 0; j < ME_COORD_NUM; ++j) {
-        double delta = mePhi(j, zNew) - mePhi(j, zOld);
-        meTheta[task][j] = clipd(meTheta[task][j] + ME_ETA * delta,
-                                 -ME_THETA_MAX, ME_THETA_MAX);
+    // Paper Eq. (4): recompute every empirical mean using the NEW scale M+xi.
+    long double moments[ME_COORD_NUM];
+    long double denominator = (long double)meCount[task];
+    const long double scale = (long double)meMaxValue[task] + (long double)ME_EPS;
+    for (int m = 0; m < ME_COORD_NUM; ++m) {
+        denominator *= scale;
+        moments[m] = mePowerSum[task][m] / denominator;
     }
 
-    if (oldMax > 0ULL && oldValue == oldMax && newValue < oldValue) {
+    std::array<double, ME_GRID_SIZE> weights;
+    const double total = meModelWeights(task, weights);
+    const auto& phi = meGridPhi();
+    for (int coord = 0; coord < ME_COORD_NUM; ++coord) {
+        const int degree = coord + 1;
+        long double coefficient = (degree % 2) ? -1.0L : 1.0L;
+        long double empirical = coefficient;
+        for (int m = 1; m <= degree; ++m) {
+            // a[j,m] / a[j,m-1] = -(j-m+1)(j+m)/m^2.
+            coefficient *= -(long double)(degree - m + 1) * (degree + m)
+                           / ((long double)m * m);
+            empirical += coefficient * moments[m - 1];
+        }
+        double model = 0.0;
+        for (int l = 0; l < ME_GRID_SIZE; ++l) model += phi[l][coord] * weights[l];
+        // Weights were computed once from the previous theta: simultaneous step.
+        meTheta[task][coord] += ME_ETA * ((double)empirical - model / total);
+    }
+}
+
+void Sketch::meApplyValueTransition(int task, bool oldPresent, unsigned __int128 oldValue,
+                                    bool newPresent, unsigned __int128 newValue) {
+    if (task < 0 || task >= TASK_NUM) return;
+    if (oldPresent == newPresent && oldValue == newValue) return;
+
+    if (oldPresent && !newPresent) --meCount[task];
+    if (!oldPresent && newPresent) ++meCount[task];
+    long double oldPower = 1.0L, newPower = 1.0L;
+    for (int m = 0; m < ME_COORD_NUM; ++m) {
+        oldPower *= (long double)oldValue;
+        newPower *= (long double)newValue;
+        mePowerSum[task][m] += (newPresent ? newPower : 0.0L)
+                            - (oldPresent ? oldPower : 0.0L);
+    }
+
+    if (meCount[task] == 0) {
+        meMaxValue[task] = 0;
+        for (int m = 0; m < ME_COORD_NUM; ++m) mePowerSum[task][m] = 0.0L;
+        // No empirical distribution: keep the previous theta for the next item.
+        return;
+    }
+
+    const unsigned __int128 oldMax = meMaxValue[task];
+    if (newPresent && newValue >= oldMax) {
+        meMaxValue[task] = newValue;
+    } else if (oldPresent && oldValue == oldMax) {
+        // The bucket has already been changed, so scan the remaining residents.
         meRescanMaxValue(task);
     }
+    meUpdateModel(task);
 }
 
 void Sketch::setSharedBucket(SharedBucket &b, uint64_t key, int task, uint64_t u1, uint64_t u2) {
     int oldTask = (b.key == UINT64_MAX) ? -1 : (int)b.task;
-    uint64_t oldValue = (oldTask >= 0 && oldTask < TASK_NUM) ? bucketScalar(oldTask, b.u1, b.u2) : 0ULL;
-    uint64_t newValue = (task >= 0 && task < TASK_NUM) ? bucketScalar(task, u1, u2) : 0ULL;
+    const int newTask = (key == UINT64_MAX) ? -1 : task;
+    const bool oldPresent = oldTask >= 0 && oldTask < TASK_NUM;
+    const bool newPresent = newTask >= 0 && newTask < TASK_NUM;
+    const unsigned __int128 oldValue = oldPresent ? meBucketValue(oldTask, b.u1, b.u2) : 0;
+    const unsigned __int128 newValue = newPresent ? meBucketValue(newTask, u1, u2) : 0;
 
     b.key = key;
     b.task = (uint8_t)task;
     b.u1 = u1;
     b.u2 = u2;
 
-    if (oldTask == task) {
-        meApplyValueTransition(task, oldValue, newValue);
+    if (oldPresent && newPresent && oldTask == newTask) {
+        meApplyValueTransition(newTask, true, oldValue, true, newValue);
     } else {
-        if (oldTask >= 0 && oldTask < TASK_NUM) meApplyValueTransition(oldTask, oldValue, 0ULL);
-        if (task >= 0 && task < TASK_NUM) meApplyValueTransition(task, 0ULL, newValue);
+        if (oldPresent) meApplyValueTransition(oldTask, true, oldValue, false, 0);
+        if (newPresent) meApplyValueTransition(newTask, false, 0, true, newValue);
     }
 }
 
 void Sketch::clearSharedBucket(SharedBucket &b) {
     int oldTask = (b.key == UINT64_MAX) ? -1 : (int)b.task;
-    uint64_t oldValue = (oldTask >= 0 && oldTask < TASK_NUM) ? bucketScalar(oldTask, b.u1, b.u2) : 0ULL;
+    const unsigned __int128 oldValue = (oldTask >= 0 && oldTask < TASK_NUM)
+                                    ? meBucketValue(oldTask, b.u1, b.u2) : 0;
 
     b.key = UINT64_MAX;
     b.u1 = 0ULL;
@@ -177,7 +401,7 @@ void Sketch::clearSharedBucket(SharedBucket &b) {
     b.task = 0;
 
     if (oldTask >= 0 && oldTask < TASK_NUM) {
-        meApplyValueTransition(oldTask, oldValue, 0ULL);
+        meApplyValueTransition(oldTask, true, oldValue, false, 0);
     }
 }
 
@@ -409,8 +633,8 @@ Sketch::Sketch(int row_, int col_, uint32_t allTimeBFBits, int bfK,
     persistPairWinBF = BloomFilter(allTimeBFBits, bfK, 9100);
     aionPairWinBF    = BloomFilter(allTimeBFBits, bfK, 9200);
     ePairBF          = BloomFilter(allTimeBFBits, bfK, 9300);
-    blacklistDFShared = BloomFilter(allTimeBFBits << 1, bfK, 9400);
-    blacklistDFEx     = BloomFilter(allTimeBFBits << 1, bfK, 9500);
+    cppBlacklist(this, true) = CppBlacklistBF(allTimeBFBits << 1, bfK, 9400);
+    cppBlacklist(this, false)     = CppBlacklistBF(allTimeBFBits << 1, bfK, 9500);
 
     exCol = std::max(1, col / TASK_NUM);
 
@@ -437,8 +661,12 @@ Sketch::Sketch(int row_, int col_, uint32_t allTimeBFBits, int bfK,
     for (int t = 0; t < TASK_NUM; t++) {
         N_est[t] = 0;
         M_mass[t] = 0;
-        meMaxValue[t] = 0ULL;
-        for (int j = 0; j < ME_COORD_NUM; ++j) meTheta[t][j] = 0.0;
+        meCount[t] = 0;
+        meMaxValue[t] = 0;
+        for (int j = 0; j < ME_COORD_NUM; ++j) {
+            mePowerSum[t][j] = 0.0L;
+            meTheta[t][j] = 0.0;
+        }
         alpha_cur[t] = ZIPF_ALPHA_INIT;
         alpha_frozen[t] = false;
         alpha_hist[t].clear();
@@ -462,6 +690,7 @@ Sketch::Sketch(int row_, int col_, uint32_t allTimeBFBits, int bfK,
 }
 
 Sketch::~Sketch() {
+    cppBlacklists().erase(this);
     if (bucket) {
         for (int i = 0; i < row; i++) delete[] bucket[i];
         delete[] bucket;
@@ -505,7 +734,7 @@ int Sketch::getBucketIndex(int row_idx, const std::string& key, bool ex) const {
 double Sketch::getPercentFast(int task, uint64_t value) const {
     if (task < 0 || task >= TASK_NUM) return -1.0;
     if (value == 0) return 0.0;
-    if (meMaxValue[task] == 0ULL) return -1.0;
+    if (meCount[task] == 0) return -1.0;
     return meCDF(task, meNormalizeValue(task, (long double)value));
 }
 
@@ -516,25 +745,16 @@ double Sketch::getPercentFastShared(int task, uint64_t value) const {
 double Sketch::getPercentFast128(int task, unsigned __int128 value) const {
     if (task < 0 || task >= TASK_NUM) return -1.0;
     if (value == (unsigned __int128)0) return 0.0;
-    if (meMaxValue[task] == 0ULL) return -1.0;
+    if (meCount[task] == 0) return -1.0;
     return meCDF(task, meNormalizeValue(task, (long double)value));
 }
 
 uint64_t Sketch::getValueFast(int task, double percent) const {
-    if (task < 0 || task >= TASK_NUM) return 0;
-    if (meMaxValue[task] == 0ULL) return 0;
-    const double p = clip01(percent);
-    double lo = 0.0;
-    double hi = 1.0;
-    for (int it = 0; it < 32; ++it) {
-        double mid = 0.5 * (lo + hi);
-        if (meCDF(task, mid) < p) lo = mid;
-        else hi = mid;
-    }
-    long double v = (long double)(0.5 * (lo + hi)) * (long double)meMaxValue[task];
+    long double v = meQuantileValue(task, percent);
     if (!(v > 0.0L)) return 0ULL;
-    if (v > (long double)UINT64_MAX) return UINT64_MAX;
-    return (uint64_t)(v + 0.5L);
+    v += 0.5L;
+    if (v >= (long double)UINT64_MAX) return UINT64_MAX;
+    return (uint64_t)v;
 }
 
 uint64_t Sketch::getValueFastShared(int task, double percent) const {
@@ -542,8 +762,12 @@ uint64_t Sketch::getValueFastShared(int task, double percent) const {
 }
 
 unsigned __int128 Sketch::getValueFast128(int task, double percent) const {
-    if (task < 0 || task >= TASK_NUM) return (unsigned __int128)0;
-    return (unsigned __int128)getValueFast(task, percent);
+    long double v = meQuantileValue(task, percent);
+    if (!(v > 0.0L)) return (unsigned __int128)0;
+    v += 0.5L;
+    const unsigned __int128 maxValue = ~(unsigned __int128)0;
+    if (v >= (long double)maxValue) return maxValue;
+    return (unsigned __int128)v;
 }
 
 // ===================== 任务重要性标量 =====================
@@ -777,7 +1001,7 @@ void Sketch::processSharedAionP(uint64_t itemKey, uint32_t dd) {
             else if ((uint64_t)dd > ps) cnt = (tcur128 + (unsigned __int128)dd - 1) / (unsigned __int128)dd;
             else cnt = cnt + 1;
             if (cnt >= (unsigned __int128)D_REPORT_THRESHOLD) {
-                blacklistDFShared.insert(itemKey);
+                cppBlacklist(this, true).insert(itemKey, 3);
                 reportedDShared.insert(itemKey);
                 clearSharedBucket(b);
             } else {
@@ -794,7 +1018,7 @@ void Sketch::processSharedAionP(uint64_t itemKey, uint32_t dd) {
         SharedBucket &b = bucket[i][(int)idx];
         if (b.key == UINT64_MAX) {
             if (delta128 >= (unsigned __int128)D_REPORT_THRESHOLD) {
-                blacklistDFShared.insert(itemKey);
+                cppBlacklist(this, true).insert(itemKey, 3);
                 reportedDShared.insert(itemKey);
                 return;
             }
@@ -836,7 +1060,7 @@ void Sketch::processSharedAionP(uint64_t itemKey, uint32_t dd) {
 
     unsigned __int128 newCnt = baseImp + delta128;
     if (newCnt >= (unsigned __int128)D_REPORT_THRESHOLD) {
-        blacklistDFShared.insert(itemKey);
+        cppBlacklist(this, true).insert(itemKey, 3);
         reportedDShared.insert(itemKey);
         clearSharedBucket(v);
         return;
@@ -1149,7 +1373,7 @@ void Sketch::processExclusiveAionP(uint64_t itemKey, uint32_t dd) {
             else if ((uint64_t)dd > ps) cnt = (tcur128 + (unsigned __int128)dd - 1) / (unsigned __int128)dd;
             else cnt = cnt + 1;
             if (cnt >= (unsigned __int128)D_REPORT_THRESHOLD) {
-                blacklistDFEx.insert(itemKey);
+                cppBlacklist(this, false).insert(itemKey, 3);
                 reportedDExclusive.insert(itemKey);
                 clearExBucket(b);
             } else {
@@ -1165,7 +1389,7 @@ void Sketch::processExclusiveAionP(uint64_t itemKey, uint32_t dd) {
             ExBucket &b = ex[i][(int)idx];
             if (b.key == UINT64_MAX) {
                 if (delta128 >= (unsigned __int128)D_REPORT_THRESHOLD) {
-                    blacklistDFEx.insert(itemKey);
+                    cppBlacklist(this, false).insert(itemKey, 3);
                     reportedDExclusive.insert(itemKey);
                 } else {
                     b.key = itemKey;
@@ -1189,7 +1413,7 @@ void Sketch::processExclusiveAionP(uint64_t itemKey, uint32_t dd) {
             if ((double)lhs >= rhs) {
                 unsigned __int128 newCnt = oldCnt + delta128;
                 if (newCnt >= (unsigned __int128)D_REPORT_THRESHOLD) {
-                    blacklistDFEx.insert(itemKey);
+                    cppBlacklist(this, false).insert(itemKey, 3);
                     reportedDExclusive.insert(itemKey);
                     clearExBucket(b);
                 } else {
@@ -1380,9 +1604,9 @@ void Sketch::processPacket(int task, uint64_t pairKey, uint32_t pktSize, uint32_
         }
     } else if (task == 3) {
         // D 的 shared / exclusive 黑名单彻底各查各的：
-        // shared 侧只看 blacklistDFShared，并且只有 shared 侧才维护 D 的 M / 采样池 / N；
-        // exclusive 侧只看 blacklistDFEx，不参与这些统计量维护。
-        const bool sharedAllowed = !blacklistDFShared.contains(pairKey);
+        // shared 侧只看 cppBlacklist(this, true)，并且只有 shared 侧才维护 D 的 M / 采样池 / N；
+        // exclusive 侧只看 cppBlacklist(this, false)，不参与这些统计量维护。
+        const bool sharedAllowed = !cppBlacklist(this, true).contains(pairKey, task);
         if (sharedAllowed) {
             // taskD 的 M 仍按“每个窗口内 distinct(src,dst) 计一次、跨窗口持续累加”的方式更新；
             // 这里只清空窗口级去重 BF，不清空 M_mass[3] 本身。
@@ -1391,29 +1615,12 @@ void Sketch::processPacket(int task, uint64_t pairKey, uint32_t pktSize, uint32_
                 M_mass[3] = sat_add_u64(M_mass[3], 1ULL);
             }
         }
-   int ok1=0;
-       for (uint64_t key64 : reportedDShared) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (blacklistDFShared.contains(pairKey)&&key64==pairKey) ok1=1;
-        }
-         for (uint64_t key64 : wrongDShared) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (key64==pairKey) ok1=1;
-        }
-        if(ok1==0&&blacklistDFEx.contains(pairKey)){DSC++;wrongDShared.insert(pairKey);}
-        else DSC1++;
-        const bool exAllowed = !blacklistDFEx.contains(pairKey);
-int ok=0;
-       for (uint64_t key64 : reportedDExclusive) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (!exAllowed&&key64==pairKey) ok=1;
-        }
-        for (uint64_t key64 : wrongDExclusive) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (key64==pairKey) ok=1;
-        }
-        if(ok==0&&blacklistDFEx.contains(pairKey)){DEC++;wrongDExclusive.insert(pairKey);}
-        else DEC1++;
+        const bool exAllowed = !cppBlacklist(this, false).contains(pairKey, task);
+        // DSC/DEC 是 X，DSC1/DEC1 是 Y；不依赖 ground_truth。
+        countBlacklistQuery(this, curWindowId + 1ULL, 2, pairKey,
+                            !sharedAllowed, DSC, DSC1, "DSC");
+        countBlacklistQuery(this, curWindowId + 1ULL, 3, pairKey,
+                            !exAllowed, DEC, DEC1, "DEC");
         const uint64_t ringWin = aionBfCounter % (uint64_t)aionTolerance;
 
         uint32_t ddShared = 0;
@@ -1474,31 +1681,15 @@ int ok=0;
     } else if (task == 5) {
         // F 的 shared / exclusive 黑名单也彻底各查各的。
         // M / 采样池 / N 只在 shared 侧维护；exclusive 侧不维护这些统计量。
-           int ok1=0;
-       for (uint64_t key64 : reportedFShared) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (blacklistDFShared.contains(pairKey)&&key64==pairKey) ok1=1;
-        }
-        for (uint64_t key64 : wrongFShared) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (key64==pairKey) ok1=1;
-        }
-        if(ok1==0&&blacklistDFEx.contains(pairKey)){FSC++;wrongFShared.insert(pairKey);}
-        else FSC1++;
-        int ok=0;
-       for (uint64_t key64 : reportedFExclusive) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (blacklistDFEx.contains(pairKey)&&key64==pairKey) ok=1;
-        }
-        for (uint64_t key64 : wrongFExclusive) {
-        // 只在该任务 universe 内统计，避免跨任务键污染 FP/FN/TN
-        if (key64==pairKey) ok=1;
-        }
-        if(ok==0&&blacklistDFEx.contains(pairKey)){FEC++;
-        wrongFExclusive.insert(pairKey);}
-        else FEC1++;
-        if (!blacklistDFShared.contains(pairKey)) processSharedBurstF(pairKey, hashKey);
-        if (!blacklistDFEx.contains(pairKey)) processExclusiveBurstF(pairKey, hashKey);
+        const bool sharedAllowed = !cppBlacklist(this, true).contains(pairKey, task);
+        const bool exAllowed = !cppBlacklist(this, false).contains(pairKey, task);
+        // FSC/FEC 是 X，FSC1/FEC1 是 Y；两侧使用各自的实际插入历史。
+        countBlacklistQuery(this, curWindowId + 1ULL, 0, pairKey,
+                            !sharedAllowed, FSC, FSC1, "FSC");
+        countBlacklistQuery(this, curWindowId + 1ULL, 1, pairKey,
+                            !exAllowed, FEC, FEC1, "FEC");
+        if (sharedAllowed) processSharedBurstF(pairKey, hashKey);
+        if (exAllowed) processExclusiveBurstF(pairKey, hashKey);
         
         return;
     }
@@ -1569,7 +1760,7 @@ void Sketch::endTimeWindow() {
                 if (ts != 0ULL &&
                     thisWin >= ts &&
                     (thisWin - ts) <= (uint64_t)F_BURST_L) {
-                    blacklistDFShared.insert(b.key);
+                    cppBlacklist(this, true).insert(b.key, 5);
                     reportedFShared.insert(b.key);
                     clearSharedBucket(b);
                     reported = true;
@@ -1607,7 +1798,7 @@ void Sketch::endTimeWindow() {
                 if (ts != 0ULL &&
                     thisWin >= ts &&
                     (thisWin - ts) <= (uint64_t)F_BURST_L) {
-                    blacklistDFEx.insert(b.key);
+                    cppBlacklist(this, false).insert(b.key, 5);
                     reportedFExclusive.insert(b.key);
                 
                     clearExBucket(b);
